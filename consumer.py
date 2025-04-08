@@ -1,58 +1,48 @@
-import json
-import os
-import pandas as pd
-from kafka import KafkaConsumer
+from pyspark.sql import SparkSession
+from pyspark.sql.functions import from_json, col
+from pyspark.sql.types import StructType, StringType, BooleanType, DoubleType
 
-# Expected number of messages (should match the producer's configuration)
-EXPECTED_CUSTOMERS = 100
-EXPECTED_ACCOUNTS = 150
-EXPECTED_TRANSACTIONS = 1000
+# Create SparkSession
+spark = SparkSession.builder \
+    .appName("KafkaTransactionsConsumer") \
+    .getOrCreate()
 
-# Initialize Kafka consumer to listen to three topics with JSON deserialization
-consumer = KafkaConsumer(
-    'customers_topic', 'accounts_topic', 'transactions_topic',
-    bootstrap_servers='localhost:9092',
-    group_id='parquet-consumer-group',
-    auto_offset_reset='earliest',  # start at beginning of topic if no offset
-    value_deserializer=lambda m: json.loads(m.decode('utf-8'))  # decode bytes to JSON dict
-)
+# Define schema for transactions
+transaction_schema = StructType() \
+    .add("transaction_id", StringType()) \
+    .add("account_id", StringType()) \
+    .add("account_type", StringType()) \
+    .add("timestamp", StringType()) \
+    .add("amount", DoubleType()) \
+    .add("transaction_type", StringType()) \
+    .add("merchant", StringType()) \
+    .add("location", StringType()) \
+    .add("is_foreign", BooleanType()) \
+    .add("is_high_risk_country", BooleanType()) \
+    .add("opening_balance", DoubleType()) \
+    .add("closing_balance", DoubleType()) \
+    .add("is_fraud", BooleanType()) \
+    .add("fraud_reasons", StringType())
 
-print("Consumer started. Waiting for messages... (will exit when expected messages are received)")
+# Read from Kafka
+kafka_df = spark.readStream \
+    .format("kafka") \
+    .option("kafka.bootstrap.servers", "localhost:9092") \
+    .option("subscribe", "transactions_topic") \
+    .option("startingOffsets", "earliest") \
+    .load()
 
-# Lists to collect messages for each topic
-customers_data = []
-accounts_data = []
-transactions_data = []
+# Convert the value column from binary to string and parse JSON
+parsed_df = kafka_df.selectExpr("CAST(value AS STRING) as json_string") \
+    .withColumn("data", from_json(col("json_string"), transaction_schema)) \
+    .select("data.*")
 
-try:
-    for message in consumer:
-        # message.value is already a Python dict due to the deserializer
-        data = message.value
-        topic = message.topic
+# Write to Parquet (you can change this to 'console' for debugging)
+query = parsed_df.writeStream \
+    .format("parquet") \
+    .option("path", "parquet/transactions") \
+    .option("checkpointLocation", "parquet/transactions_checkpoint") \
+    .outputMode("append") \
+    .start()
 
-        # Store the record in the corresponding list
-        if topic == 'customers_topic':
-            customers_data.append(data)
-        elif topic == 'accounts_topic':
-            accounts_data.append(data)
-        elif topic == 'transactions_topic':
-            transactions_data.append(data)
-
-        # (Optional) print confirmation for each received message
-        print(f"Received message from {topic}: {data}")
-
-        # Check if all expected messages have been received
-        if (len(customers_data) >= EXPECTED_CUSTOMERS and 
-            len(accounts_data) >= EXPECTED_ACCOUNTS and 
-            len(transactions_data) >= EXPECTED_TRANSACTIONS):
-            print("Expected number of messages received. Exiting consumer loop.")
-            break
-except KeyboardInterrupt:
-    # Allow the user to break out of the loop with Ctrl+C
-    pass
-finally:
-    # On exit, write each list to a Parquet file regardless of whether data was received
-    pd.DataFrame(customers_data).to_parquet('customers.parquet', engine='pyarrow', index=False)
-    pd.DataFrame(accounts_data).to_parquet('accounts.parquet', engine='pyarrow', index=False)
-    pd.DataFrame(transactions_data).to_parquet('transactions.parquet', engine='pyarrow', index=False)
-    print("Consumer stopped. Parquet files have been written to:", os.getcwd())
+query.awaitTermination()
